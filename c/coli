@@ -575,10 +575,14 @@ def env_for_engine(a, arch, plan=None):
             plan_must_not_choose_omp=("OMP_NUM_THREADS" not in env
                                       and (arch == "deepseek_v4"
                                            or env.get("COLI_NO_OMP_TUNE")))
-            env=environment_for_plan(plan,env,
-                                     cuda_enabled=env.get("COLI_CUDA") == "1")
+            cuda_on = env.get("COLI_CUDA") == "1"
+            env=environment_for_plan(plan,env,cuda_enabled=cuda_on)
         except (OSError,ValueError,json.JSONDecodeError) as error:
             sys.exit(f"{C.yel}invalid resource plan:{C.r} {error}")
+        # Outside the try on purpose: this only prints, and a display helper
+        # that stumbled inside it would be reported as "invalid resource plan"
+        # and take the launch down with it.
+        if not cuda_on: report_unapplied_vram_tier(plan)
         if plan_must_not_choose_omp:
             # environment_for_plan supplies the physical-core default used by
             # the other engines. V4 deliberately computes logical CPUs minus
@@ -693,6 +697,41 @@ def requested_kv_slots(a, env):
     value=getattr(a,"kv_slots",None)
     if value is None: value=int(env.get("COLI_KV_SLOTS","1"))
     return value
+
+def report_unapplied_vram_tier(plan):
+    """Say so when --auto-tier keeps a real VRAM tier out of the launch.
+
+    Dropping it is deliberate, and the contract above explains why: --gpu and
+    --vram are what select a CUDA-capable build, so merely asking for the plan
+    must never turn a CPU-only sibling binary into an attempted CUDA launch.
+
+    Doing it in SILENCE was not deliberate. `coli plan` and `coli doctor` print
+    the VRAM tier as part of the plan, --auto-tier is documented as applying
+    that plan, and then the tier vanishes with nothing on screen to connect the
+    two. On the box in #1581 the silence cost most of the throughput -- 11.8
+    tok/s became 21 once --gpu auto was added -- and the user had no way to see
+    that the plan they had just read was not the plan that ran.
+
+    The test for "real" is the planner's own: a device qualified to drive
+    placement, and a budget above zero. Anything else was already not going to
+    be applied with the GPU on either, and saying so would be noise.
+    """
+    try:
+        from resource_plan import plans_placement, GB
+        vram = plan["tiers"]["vram"]
+        devices = [d for d in vram["devices"] if plans_placement(d)]
+        budget = vram["budget_bytes"]
+    except (ImportError, KeyError, TypeError, AttributeError):
+        return
+    if not devices or budget <= 0:
+        return
+    where = ", ".join(f"{d['index']}:{d.get('name') or 'GPU'}" for d in devices)
+    print(f"  {C.yel}[PLAN] the plan's VRAM tier is not being applied{C.r}\n"
+          f"  {C.dim}{budget / GB:.1f} GB on {where} stays unused. --auto-tier "
+          f"applies the RAM plan but never enables the GPU by itself, so a "
+          f"CPU-only build is never launched as a CUDA one. Add --gpu auto "
+          f"(or --vram N) to use it.{C.r}", file=sys.stderr)
+
 
 def env_for(a):
     explicit_env = set(os.environ)
